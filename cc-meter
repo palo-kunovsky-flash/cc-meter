@@ -1,0 +1,1277 @@
+#!/usr/bin/env python3
+"""cc-meter: live terminal dashboard for global Claude Code usage.
+
+Data sources, each refreshed on its own interval:
+  * rate limits (5h / 7d) from the OAuth endpoint behind `/usage`, with the
+    token read from the macOS Keychain (or ~/.claude/.credentials.json);
+  * throughput, tokens, models, projects and sessions from every transcript
+    under ~/.claude/projects, read incrementally (only new bytes per refresh).
+
+State lives in ~/.cache/cc-meter: limit samples (burn rate, forecasts, the
+burn heatmap) and a transcript index (file offsets + the last 7 days of
+requests), so a restart does not rescan gigabytes of transcripts.
+
+Keys: q quit · ↑↓ j k PgUp PgDn g G / mouse wheel scroll · w cycle chart
+window · r refresh · u poll the usage API now
+"""
+
+import argparse
+import datetime as dt
+import glob
+import json
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import termios
+import threading
+import time
+import textwrap
+import tty
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+SESSIONS = os.path.join(CLAUDE_DIR, "sessions")
+CACHE_DIR = os.path.join(HOME, ".cache", "cc-meter")
+SAMPLES = os.path.join(CACHE_DIR, "usage.jsonl")
+INDEX = os.path.join(CACHE_DIR, "index.json")
+STATUSLINE = os.path.join(CACHE_DIR, "statusline.json")
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")  # oauthAccount: who is logged in
+STATUS_URL = "https://status.claude.com/api/v2/summary.json"  # written by statusline-command.sh
+INDEX_VERSION = 6
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+WINDOWS_H = [1, 2, 3, 6, 12, 24]
+HISTORY_S = 8 * 86400  # 7 full calendar days plus today's head start
+MAX_REQ_S = 600        # a request spanning longer than this is an idle gap, not generation
+SAMPLE_KEYS = ("t", "five", "five_reset", "week", "week_reset", "acct")
+
+
+# ── look & text helpers ───────────────────────────────────────────────────────
+# Linear/Vercel-like: grey scale for structure, one accent for data, and
+# semantic color only where it carries meaning (ok / warning / problem).
+def fg(rgb):
+    return "\033[38;2;%d;%d;%dm" % rgb
+
+RST, BOLD = "\033[0m", "\033[1m"
+WHITE = (236, 236, 236)     # primary values
+GREY = (140, 140, 146)      # labels, secondary text
+FAINT = (78, 78, 84)        # rules, bar tracks, hints
+ACCENT = (96, 165, 250)     # neutral highlight
+SPEED_RGB = (45, 212, 191)  # teal
+LAT_RGB = (251, 146, 160)   # rose
+OUT_RGB = (96, 165, 250)    # blue
+SOFT_BAD = (232, 128, 118)  # forecasts: noticeable, not alarming
+OK, WARN, BAD = (80, 200, 120), (240, 180, 50), (240, 85, 85)
+C_WHITE, C_GREY, C_FAINT, C_ACCENT = fg(WHITE), fg(GREY), fg(FAINT), fg(ACCENT)
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+
+
+RAMP = ((0.0, OK), (0.5, (220, 200, 70)), (0.75, WARN), (1.0, BAD))
+
+
+def ramp(t):
+    """Green → yellow → amber → red for t in 0..1."""
+    t = max(0.0, min(1.0, t))
+    for (t0, c0), (t1, c1) in zip(RAMP, RAMP[1:]):
+        if t <= t1:
+            k = (t - t0) / (t1 - t0)
+            return tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3))
+    return RAMP[-1][1]
+
+
+def vis_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def trunc(s, w):
+    """Cut to w visible columns without breaking escape sequences."""
+    out, n, i = [], 0, 0
+    while i < len(s) and n < w:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out) + RST
+
+
+def fit(s, w):
+    """Exactly w columns: padded, or cut with an ellipsis."""
+    if vis_len(s) > w:
+        return trunc(s, max(0, w - 1)) + C_FAINT + "…" + RST
+    return s + " " * (w - vis_len(s))
+
+
+def wrap_segs(segs, width, sep="   "):
+    """Lay segments out over as many lines as needed; a segment wider than
+    the whole line is the only thing ever cut."""
+    lines, cur = [], ""
+    for seg in segs:
+        if not seg:
+            continue
+        cand = seg if not cur else cur + sep + seg
+        if vis_len(cand) <= width:
+            cur = cand
+            continue
+        if cur:
+            lines.append(cur)
+        cur = seg if vis_len(seg) <= width else fit(seg, width)
+    return lines + [cur] if cur else lines or [""]
+
+
+def words(text, rgb=GREY, bold=False):
+    """Prose as one segment per word, for wrap_segs(..., sep=" ")."""
+    pre = fg(rgb) + (BOLD if bold else "")
+    return [pre + wd + RST for wd in text.split()]
+
+
+def kv(label, value, rgb=WHITE):
+    """'label value' with the label muted: the basic unit of every line."""
+    return f"{C_GREY}{label}{RST} {fg(rgb)}{value}{RST}" if label else f"{fg(rgb)}{value}{RST}"
+
+
+def fmt_num(n):
+    n = float(n)
+    for unit, div in (("G", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(n) >= div:
+            return f"{n / div:.1f}{unit}"
+    return f"{n:.0f}"
+
+
+def fmt_dur(sec):
+    sec = int(max(0, sec))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def fmt_ago(sec):
+    return f"{int(sec)}s ago" if sec < 60 else f"{fmt_dur(sec)} ago"
+
+
+def fmt_clock(ts, now):
+    t = dt.datetime.fromtimestamp(ts)
+    same_day = t.date() == dt.datetime.fromtimestamp(now).date()
+    return t.strftime("%H:%M" if same_day else "%a %H:%M")
+
+
+def parse_ts(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+# ── transcripts ───────────────────────────────────────────────────────────────
+# A request record is a list, indexed by these constants, to keep the index small.
+R_START, R_FIRST, R_END, R_OUT, R_IN, R_CR, R_CC, R_MODEL, R_SESSION, R_CWD, R_FINAL, R_CHARS, R_C1H, R_SUB = range(14)
+
+
+class Transcripts:
+    """Incremental reader: remembers a byte offset per file, consumes only
+    complete new lines, and folds streamed blocks into one record per request.
+
+    Streamed blocks of one request each carry a usage object; early blocks
+    can hold a partial output count, so every field takes the max. Resumed
+    sessions copy history into a new file under the same requestId, which the
+    dict key dedupes.
+
+    Background subagent transcripts never get the final usage: their blocks
+    carry stop_reason null and the message_start output count (single digits).
+    R_FINAL marks requests that did get it; for the rest the visible content
+    length (R_CHARS) is kept so View can estimate their output."""
+
+    def __init__(self):
+        self.files, self.reqs = {}, {}
+        try:
+            with open(INDEX) as fh:
+                ix = json.load(fh)
+            if ix.get("v") == INDEX_VERSION:
+                self.files, self.reqs = ix["files"], ix["reqs"]
+        except (OSError, ValueError, KeyError):
+            pass
+        self.saved = time.time()
+
+    def save(self):
+        tmp = INDEX + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"v": INDEX_VERSION, "files": self.files, "reqs": self.reqs},
+                      fh, separators=(",", ":"))
+        os.replace(tmp, INDEX)
+        self.saved = time.time()
+
+    def refresh(self, now, progress=None):
+        cutoff = now - HISTORY_S
+        paths = glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True)
+        for n, path in enumerate(paths):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            state = self.files.get(path)
+            if state is None:
+                # Untouched for longer than the history: nothing in it counts.
+                state = self.files[path] = [st.st_size if st.st_mtime < cutoff else 0, None]
+            if st.st_size < state[0]:  # truncated / rewritten
+                state[:] = [0, None]
+            if st.st_size == state[0]:
+                continue
+            self._read(path, state)
+            if progress and n % 40 == 0:
+                progress(n, len(paths))
+        for rid in [k for k, r in self.reqs.items() if r[R_END] < cutoff]:
+            del self.reqs[rid]
+        if len(self.files) > len(paths):  # forget deleted transcripts
+            live = set(paths)
+            for path in [p for p in self.files if p not in live]:
+                del self.files[path]
+
+    def _read(self, path, state):
+        parts = path.split(os.sep)
+        sub = "subagents" in parts
+        session = parts[parts.index("subagents") - 1] if sub else os.path.splitext(parts[-1])[0]
+        with open(path, "rb") as fh:
+            fh.seek(state[0])
+            data = fh.read()
+        last_nl = data.rfind(b"\n")
+        if last_nl < 0:
+            return
+        state[0] += last_nl + 1
+        for line in data[: last_nl + 1].splitlines():
+            if b'"type":"assistant"' in line:
+                self._assistant(line, state, session, sub)
+            elif b'"type":"user"' in line:
+                # The top-level timestamp sits mid-line, after the (possibly
+                # huge) message, so only a real parse finds it reliably.
+                try:
+                    state[1] = parse_ts(json.loads(line)["timestamp"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+
+    def _assistant(self, line, state, session, sub):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return
+        msg = d.get("message") or {}
+        rid, model = d.get("requestId"), msg.get("model") or "?"
+        if not rid or model.startswith("<"):
+            return
+        try:
+            ts = parse_ts(d["timestamp"])
+        except (KeyError, ValueError):
+            return
+        u = msg.get("usage") or {}
+        r = self.reqs.get(rid)
+        if r is None:
+            r = self.reqs[rid] = [state[1], ts, ts, 0, 0, 0, 0, model, session,
+                                  os.path.basename(d.get("cwd") or "") or "?", False, 0, 0, sub]
+        if msg.get("stop_reason") is not None:
+            r[R_FINAL] = True
+        for c in msg.get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                r[R_CHARS] += len(c.get("text") or "")
+            elif c.get("type") == "thinking":
+                r[R_CHARS] += len(c.get("thinking") or "")
+            elif c.get("type") == "tool_use":
+                r[R_CHARS] += len(json.dumps(c.get("input"), ensure_ascii=False))
+        r[R_END] = max(r[R_END], ts)
+        r[R_OUT] = max(r[R_OUT], u.get("output_tokens") or 0)
+        r[R_IN] = max(r[R_IN], u.get("input_tokens") or 0)
+        r[R_CR] = max(r[R_CR], u.get("cache_read_input_tokens") or 0)
+        r[R_CC] = max(r[R_CC], u.get("cache_creation_input_tokens") or 0)
+        r[R_C1H] = max(r[R_C1H], (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0)
+
+    def records(self, since):
+        return [r for r in self.reqs.values() if r[R_END] >= since]
+
+
+def req_duration(r):
+    """End-to-end seconds from the triggering user/tool-result line to the
+    last streamed block: includes time to first token and thinking."""
+    if r[R_START] is None or r[R_OUT] <= 0 or not r[R_FINAL]:
+        return None
+    d = r[R_END] - r[R_START]
+    return d if 0 < d < MAX_REQ_S else None
+
+
+def req_latency(r):
+    """Seconds until the first block landed (an upper bound on TTFT)."""
+    if r[R_START] is None:
+        return None
+    d = r[R_FIRST] - r[R_START]
+    return d if 0 <= d < MAX_REQ_S else None
+
+
+# ── rate limits ───────────────────────────────────────────────────────────────
+def read_token():
+    try:
+        raw = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        raw = ""
+    if not raw.strip():
+        try:
+            with open(os.path.join(CLAUDE_DIR, ".credentials.json")) as fh:
+                raw = fh.read()
+        except OSError:
+            return None
+    try:
+        return json.loads(raw)["claudeAiOauth"]["accessToken"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def monotonic(samples):
+    """Drop readings lower than an earlier one of the same account and window
+    (stale status-line readings), keeping the other limit of the sample."""
+    best, out = {}, []
+    for s in samples:
+        s = list(s)
+        for idx in (1, 3):
+            if s[idx] is None or s[idx + 1] is None:
+                continue
+            key = (s[5], idx, round(s[idx + 1] / 300))  # resets_at jitters by < 1 s between sources
+            if s[idx] < best.get(key, -1):
+                s[idx] = s[idx + 1] = None
+            else:
+                best[key] = s[idx]
+        if s[1] is not None or s[3] is not None:
+            out.append(tuple(s))
+    return out
+
+
+def read_account():
+    """(id, label) of the account Claude Code is logged in with, from the
+    oauthAccount block of ~/.claude.json."""
+    try:
+        with open(CLAUDE_JSON) as fh:
+            a = json.load(fh).get("oauthAccount") or {}
+    except (OSError, ValueError, AttributeError):
+        return None, None
+    if not a.get("accountUuid"):
+        return None, None
+    ident = f"{a['accountUuid']}:{a.get('organizationUuid') or ''}"
+    label = " · ".join(x for x in (a.get("displayName"), a.get("organizationName")) if x)
+    return ident, label or None
+
+
+class Limits:
+    """Current 5h / 7d utilization plus a sample history, per account.
+
+    Primary source is the status line: Claude Code hands it rate_limits on
+    every render, and statusline-command.sh drops them in STATUSLINE, so an
+    active session costs no API calls. The usage endpoint is the fallback
+    for when no session has rendered lately, and the authority right after
+    an account switch; it is rate limited hard (429 with retry-after 0),
+    hence the exponential backoff."""
+
+    def __init__(self):
+        self.cur, self.fetched, self.source, self.error = {}, 0.0, None, None
+        self.sl_mtime, self.backoff, self.retry_at = 0.0, 0.0, 0.0
+        self.acct, self.acct_label, self.acct_mtime = None, None, 0.0
+        self.switched, self.need_poll = 0.0, False
+        self.check_account(time.time())
+        self.need_poll = False  # the first launch polls on its own schedule
+        self.samples = []
+        cutoff = time.time() - HISTORY_S
+        try:
+            with open(SAMPLES) as fh:
+                for line in fh:
+                    try:
+                        s = json.loads(line)
+                        if s["t"] >= cutoff:
+                            # Samples from before accounts were tracked cannot be
+                            # attributed, so they get an id that never matches.
+                            s.setdefault("acct", "unknown")
+                            self.samples.append(tuple(s[k] for k in SAMPLE_KEYS))
+                    except (ValueError, KeyError):
+                        continue
+        except OSError:
+            pass
+        self.samples = monotonic(self.samples)
+        with open(SAMPLES, "w") as fh:  # compact to the history window, drop stale readings
+            for s in self.samples:
+                fh.write(json.dumps(dict(zip(SAMPLE_KEYS, s))) + "\n")
+        self.seed(time.time())
+
+    def mine(self):
+        return [s for s in self.samples if s[5] == self.acct]
+
+    def seed(self, now):
+        """Start from the newest reading of each still-open window of this
+        account, so a stale status line right after launch cannot win."""
+        for key, idx in (("five_hour", 1), ("seven_day", 3)):
+            for smp in reversed(self.mine()):
+                if smp[idx] is not None and smp[idx + 1] and smp[idx + 1] > now:
+                    self.cur[key] = (smp[idx], smp[idx + 1])
+                    self.fetched = max(self.fetched, smp[0])
+                    self.source = self.source or "saved sample"
+                    break
+
+    def check_account(self, now):
+        """Notice a /login to another account: drop the old account's numbers
+        and ask the API, which answers for whoever is logged in now."""
+        try:
+            mtime = os.stat(CLAUDE_JSON).st_mtime
+        except OSError:
+            return
+        if mtime == self.acct_mtime:
+            return
+        self.acct_mtime = mtime
+        ident, label = read_account()
+        if ident is None or ident == self.acct:
+            self.acct_label = label or self.acct_label
+            return
+        first = self.acct is None
+        self.acct, self.acct_label = ident, label
+        if first:
+            return
+        self.cur, self.fetched, self.source, self.error = {}, 0.0, None, None
+        self.switched, self.need_poll = now, True
+        self.backoff = self.retry_at = 0.0
+        self.seed(now)
+
+    def _ingest(self, t, cur, source):
+        """Merge a reading. Each session's status line reports the limits as of
+        that session's own last API response, so an idle session hands over
+        old numbers. Within one window usage only grows, so a lower value for
+        the same reset, or an older window, is stale and is ignored. The API
+        answers for the logged-in account right now, so it always wins."""
+        merged, fresh = dict(self.cur), False
+        for key, (used, reset) in cur.items():
+            old = self.cur.get(key)
+            if source != "usage API" and old and old[1] > t and \
+                    (reset < old[1] - 120 or (abs(reset - old[1]) < 120 and used < old[0])):
+                continue
+            merged[key], fresh = (used, reset), True
+        if source == "usage API":  # a limit missing from the API has no open window
+            merged, fresh = {k: v for k, v in merged.items() if k in cur}, True
+        if not fresh:
+            return
+        self.cur, self.fetched, self.source = merged, t, source
+        if source == "usage API":
+            self.error = None
+        five, week = merged.get("five_hour"), merged.get("seven_day")
+        s = (t, five and five[0], five and five[1], week and week[0], week and week[1], self.acct)
+        last = next((x for x in reversed(self.samples) if x[5] == self.acct), None)
+        # Status line renders are frequent: keep one sample per 30s unless
+        # the numbers moved.
+        if last and t - last[0] < 30 and last[1:] == s[1:]:
+            return
+        self.samples.append(s)
+        with open(SAMPLES, "a") as fh:
+            fh.write(json.dumps(dict(zip(SAMPLE_KEYS, s))) + "\n")
+
+    def read_statusline(self):
+        try:
+            mtime = os.stat(STATUSLINE).st_mtime
+            if mtime <= self.sl_mtime:
+                return
+            self.sl_mtime = mtime
+            if mtime <= self.switched:  # written for the previous account
+                return
+            with open(STATUSLINE) as fh:
+                rl = json.load(fh)
+            cur = {}
+            for key in ("five_hour", "seven_day"):
+                w = rl.get(key) or {}
+                if w.get("used_percentage") is not None and w.get("resets_at"):
+                    cur[key] = (float(w["used_percentage"]), float(w["resets_at"]))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+        if cur and mtime > self.fetched:
+            self._ingest(mtime, cur, "status line")
+
+    def poll(self, now):
+        if now < self.retry_at:
+            return
+        self.need_poll = False
+        token = read_token()
+        if not token:
+            self.error = "OAuth token not found – log in with `claude`"
+            return
+        req = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "cc-meter/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self.backoff = min(1800.0, self.backoff * 2 or 300.0)
+                self.retry_at = now + self.backoff
+                self.error = f"usage API busy (HTTP 429), next try {fmt_clock(self.retry_at, now)}"
+            else:
+                self.error = f"usage API HTTP {e.code}" + (" – open `claude` to refresh the token" if e.code == 401 else "")
+            return
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            self.error = f"network: {e}"
+            return
+        self.backoff = 0.0
+        cur = {}
+        for key in ("five_hour", "seven_day"):
+            w = data.get(key) or {}
+            # resets_at is null between windows: the old one ended and the next
+            # only starts with your next message. Nothing to record then.
+            if w.get("utilization") is None or not w.get("resets_at"):
+                continue
+            try:
+                cur[key] = (float(w["utilization"]), parse_ts(w["resets_at"]))
+            except (TypeError, ValueError, AttributeError):
+                pass
+        self.fetched = now
+        self._ingest(now, cur, "usage API")
+
+    def window(self, key):
+        return self.cur.get(key)
+
+    def history(self, idx, reset):
+        """This account's samples of the window ending at `reset`."""
+        return [(s[0], s[idx]) for s in self.mine()
+                if s[idx] is not None and s[idx + 1] is not None and abs(s[idx + 1] - reset) < 120]
+
+    def burn(self, idx, now, used, reset, length, lookback):
+        """%/s: slope over recent samples of this window, else the average
+        since the window opened."""
+        pts = [p for p in self.history(idx, reset) if p[0] >= now - lookback]
+        # Utilization comes in whole percent, so a short span is all
+        # quantization noise: demand a third of the lookback.
+        if len(pts) >= 2 and pts[-1][0] - pts[0][0] >= lookback / 3:
+            (t0, u0), (t1, u1) = pts[0], pts[-1]
+            return max(0.0, (u1 - u0) / (t1 - t0)), "recent"
+        elapsed = now - (reset - length)
+        # Minutes into a window, "4% in 7 min" extrapolates to nonsense.
+        if elapsed > min(length / 10, 3600):
+            return used / elapsed, "window avg"
+        return None, None
+
+
+# ── drawing primitives ────────────────────────────────────────────────────────
+LABEL_W = 12  # left label column, like a settings page
+
+
+def bar(pct, width):
+    """Thin progress bar; every filled cell takes the ramp color of its own
+    position, so the bar warms up as it fills."""
+    n = round(max(0.0, min(100.0, pct)) / 100 * width)
+    cells = "".join(fg(ramp(i / max(1, width - 1))) + "━" for i in range(n))
+    return cells + C_FAINT + "━" * (width - n) + RST
+
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def nice_max(x):
+    """Round a chart ceiling up to a readable step (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8 × 10^k)."""
+    if x <= 0:
+        return 1
+    mag = 10 ** math.floor(math.log10(x))
+    return next(m * mag for m in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10) if m * mag >= x)
+
+
+def bucket_plan(win_s, cw):
+    """Clock-aligned bucket size giving every bar at least 2 columns."""
+    for m in (1, 2, 5, 10, 15, 30, 60, 120, 180):
+        n = math.ceil(win_s / (m * 60))
+        if 2 * n <= cw:
+            return m * 60, n, cw // n
+    return 180 * 60, cw // 2, 2
+
+
+def bar_chart(values, bw, h, vmax, rgb):
+    """Column chart: one bar per bucket, bw columns wide incl. a 1-col gap,
+    eighth blocks for sub-row precision. None = no data (left blank)."""
+    rows = []
+    for row in range(h, 0, -1):
+        cells = []
+        for v in values:
+            if v is None:
+                cells.append(" " * bw)
+                continue
+            fill = v / vmax * h
+            ch = "█" if fill >= row else BLOCKS[max(1, int((fill - row + 1) * 8))] if fill > row - 1 else " "
+            if row == 1 and ch == " ":
+                ch = "▁"  # a bar that exists never vanishes completely
+            cells.append(fg(rgb) + ch * max(1, bw - 1) + RST + " " * (1 if bw > 1 else 0))
+        rows.append("".join(cells))
+    return rows
+
+
+def section(title, meta, w):
+    """'TITLE  meta ───────' header that names what follows and its scope."""
+    head = f"{BOLD}{C_WHITE}{title.upper()}{RST}"
+    if meta:
+        head += f"  {C_GREY}{meta}{RST}"
+    head = fit(head, w) if vis_len(head) > w else head
+    rule = w - vis_len(head) - 1
+    return [head + (" " + C_FAINT + "─" * rule + RST if rule > 0 else "")]
+
+
+def line(label, content, w, label_rgb=GREY):
+    """Label column + content, always exactly w columns."""
+    lab = fg(label_rgb) + fit(label, LABEL_W - 1) + RST + " "
+    return lab + fit(content, w - LABEL_W)
+
+
+def block(label, segs, w, label_rgb=GREY, sep="   "):
+    """Label column + segments wrapped over as many lines as they need."""
+    return [line(label if i == 0 else "", l, w, label_rgb)
+            for i, l in enumerate(wrap_segs(segs, w - LABEL_W, sep))]
+
+
+def columns(blocks, w, gap=4):
+    """Place blocks (lists of lines rendered at their own width) side by side."""
+    h = max(len(b) for b in blocks)
+    widths = [max((vis_len(l) for l in b), default=0) for b in blocks]
+    return [(" " * gap).join(fit(b[i] if i < len(b) else "", bw) for b, bw in zip(blocks, widths))
+            for i in range(h)]
+
+
+def split_w(w, n, gap=4):
+    base = (w - gap * (n - 1)) // n
+    return [base] * (n - 1) + [w - gap * (n - 1) - base * (n - 1)]
+
+
+# ── frame data ────────────────────────────────────────────────────────────────
+class View:
+    """Everything one frame needs, computed once."""
+
+    def __init__(self, tr, lim, win_h, now):
+        self.tr, self.lim, self.win_h, self.now = tr, lim, win_h, now
+        self.win_s = win_h * 3600
+        self.today_start = dt.datetime.fromtimestamp(now).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        recs = tr.records(now - 7 * 86400)
+        # Output per visible char on complete requests (thinking is mostly
+        # redacted, so this runs above a plain chars/token rate); it prices
+        # the subagent requests whose final usage never reached the disk.
+        fin = [r for r in recs if r[R_FINAL] and r[R_CHARS]]
+        chars = sum(r[R_CHARS] for r in fin)
+        self.tok_per_char = sum(r[R_OUT] for r in fin) / chars if chars > 10000 else 0.6
+        self.recs = []
+        for r in recs:
+            if not r[R_FINAL]:
+                r = r[:R_OUT] + [max(r[R_OUT], round(r[R_CHARS] * self.tok_per_char))] + r[R_OUT + 1:]
+            self.recs.append(r)
+        self.win = [r for r in self.recs if r[R_END] >= now - self.win_s]
+        self.today = [r for r in self.recs if r[R_END] >= self.today_start]
+        # Subagents often run in their own worktree (cwd "agent-…"); credit
+        # them to the project of the session that spawned them.
+        self.project = {}
+        for r in self.recs:
+            if not r[R_CWD].startswith("agent-"):
+                self.project[r[R_SESSION]] = r[R_CWD]
+        self.timed = [(r, d) for r in self.win for d in [req_duration(r)] if d]
+        self.active = []
+        for p in glob.glob(os.path.join(SESSIONS, "*.json")):
+            try:
+                with open(p) as fh:
+                    s = json.load(fh)
+                os.kill(int(s["pid"]), 0)
+                self.active.append(s)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+
+
+def speed_of(rs):
+    pairs = [(r[R_OUT], d) for r in rs for d in [req_duration(r)] if d]
+    dur = sum(d for _, d in pairs)
+    return sum(o for o, _ in pairs) / dur if dur else None
+
+
+def latency_of(rs):
+    lats = [x for x in map(req_latency, rs) if x is not None]
+    return statistics.median(lats) if lats else None
+
+
+def cache_hit(rs):
+    tin = sum(r[R_IN] + r[R_CR] + r[R_CC] for r in rs)
+    return sum(r[R_CR] for r in rs) / tin * 100 if tin else None
+
+
+# ── sections ──────────────────────────────────────────────────────────────────
+def limit_rows(v, key, idx, length, name, lookback, w):
+    lim, now = v.lim, v.now
+    win = lim.window(key)
+    if not win:
+        return block(name, words(lim.error or "waiting for data…"), w, WHITE, " ")
+    used, reset = win
+    if reset <= now:
+        return block(name, [bar(0, max(8, min(30, w - LABEL_W - 6))) + f"  {C_GREY}0%{RST}"]
+                     + words("– window not started, it opens with your next message"), w, WHITE, " ")
+    left = max(1, reset - now)
+    rate, src = lim.burn(idx, now, used, reset, length, lookback)
+    bar_w = max(8, min(30, w - LABEL_W - 6))
+    out = block(name, [
+        bar(used, bar_w) + f"  {fg(ramp(used / 100))}{BOLD}{used:.0f}%{RST}",
+        kv("resets", fmt_clock(reset, now)) + f" {C_GREY}(in {fmt_dur(left)}){RST}",
+    ], w, WHITE)
+    if used >= 100:
+        # Frozen at the moment the limit was hit: a projection that keeps
+        # sliding to "now" says nothing once the limit is spent.
+        hit = next((t for t, u in lim.history(idx, reset) if u >= 100), None)
+        return out + block("", words("Limit reached", BAD) + (words(
+            f"at {fmt_clock(hit, now)} ({fmt_ago(now - hit)}), {fmt_dur(reset - hit)} before the reset")
+            if hit else []), w, sep=" ")
+    if rate is None:
+        return out + block("", words("Pace: not enough data yet"), w, sep=" ")
+    safe = (100 - used) / left * 3600
+    # Pace against the sustainable pace: ≤0.6× green, 1× amber, ≥1.4× red.
+    ratio = rate * 3600 / safe if safe > 0 else 9
+    basis = f"last {lookback // 3600}h" if src == "recent" and lookback >= 3600 else \
+        f"last {fmt_dur(lookback)}" if src == "recent" else f"avg since {fmt_clock(reset - length, now)}"
+    out += block("", [
+        kv("pace", f"{rate * 3600:.1f}%/h", ramp((ratio - 0.6) / 0.8)) + f" {C_FAINT}({basis}){RST}",
+        kv("sustainable", f"≤ {safe:.1f}%/h"),
+    ], w)
+    projected = used + rate * left
+    if rate <= 1e-9:
+        verdict = words("Idle – nothing is being used right now", OK)
+    elif projected >= 100:
+        eta = (100 - used) / rate
+        verdict = (words(f"At this pace it runs out {fmt_clock(now + eta, now)}", SOFT_BAD)
+                   + words(f"(in {fmt_dur(eta)}), {fmt_dur(left - eta)} before the reset"))
+    elif projected >= 80:
+        verdict = words("Tight", WARN) + words(f"– about {projected:.0f}% used at reset")
+    else:
+        verdict = words("On track", OK) + words(f"– about {projected:.0f}% used at reset")
+    out += block("", verdict, w, sep=" ")
+    if key == "seven_day":
+        days_left = left / 86400
+        out += block("", words(f"Budget {(100 - used) / max(days_left, 1):.1f}% per day "
+                               f"for the remaining {days_left:.1f} days"), w, sep=" ")
+    else:
+        out5 = sum(r[R_OUT] for r in v.recs if r[R_END] >= reset - length)
+        if used >= 1 and out5:
+            per = out5 / used
+            out += block("", words(f"≈{fmt_num(per)} output tokens per 1% · "
+                                   f"≈{fmt_num(per * (100 - used))} left before the limit"), w, sep=" ")
+    return out
+
+
+def limits_section(v, w):
+    lim = v.lim
+    meta = " · ".join(x for x in (
+        lim.acct_label,
+        f"from {lim.source}, {fmt_ago(v.now - lim.fetched)}" if lim.fetched and lim.source else "",
+    ) if x)
+    out = section("Rate limits", meta, w)
+    # A failed fallback only matters once the shown numbers get old.
+    if lim.error and lim.cur and v.now - lim.fetched > 300:
+        out += block("", words(f"Numbers may be behind: {lim.error}", WARN), w, sep=" ")
+    out += limit_rows(v, "five_hour", 1, 5 * 3600, "5-hour", 1800, w)
+    out.append("")
+    out += limit_rows(v, "seven_day", 3, 7 * 86400, "Weekly", 86400, w)
+    return out
+
+
+def chart_block(values, bw, h, w, fmt, rgb):
+    """Bars plus a y scale in the label column (ceiling on top, 0 below)."""
+    known = [x for x in values if x is not None]
+    vmax = nice_max(max(known, default=0))
+    rows = bar_chart(values, bw, h, vmax, rgb)
+    out = []
+    for i, r in enumerate(rows):
+        tick = fmt(vmax) if i == 0 else "0" if i == h - 1 else ""
+        out.append(C_FAINT + f"{tick:>{LABEL_W - 2}}  " + RST + fit(r, w - LABEL_W))
+    return out
+
+
+def bucket_axis(first, bs, n, bw, cw):
+    """Bucket start times under the bars, spaced so labels never touch."""
+    axis = [" "] * cw
+    step = max(1, math.ceil(7 / bw))
+    for i in range(0, n, step):
+        lbl = dt.datetime.fromtimestamp((first + i) * bs).strftime("%H:%M")
+        if i * bw + len(lbl) > cw - 4:
+            break
+        axis[i * bw:i * bw + len(lbl)] = lbl
+    axis[cw - 3:cw] = "now"
+    return C_FAINT + "".join(axis) + RST
+
+
+def cache_ttl(rs):
+    """Which prompt-cache lifetime the writes used: Claude Code writes either
+    5-minute or 1-hour cache entries."""
+    cc = sum(r[R_CC] for r in rs)
+    if not cc:
+        return None
+    share = sum(r[R_C1H] for r in rs) / cc
+    if share > 0.95 or share < 0.05:
+        return "1 hour" if share > 0.95 else "5 min"
+    return f"1h {share * 100:.0f}% · 5m {(1 - share) * 100:.0f}%"
+
+
+def throughput_section(v, w):
+    cw = w - LABEL_W
+    bs, n, bw = bucket_plan(v.win_s, cw)
+    out = section("Throughput", f"last {v.win_h}h · {fmt_dur(bs)} bars · all sessions", w)
+    if not v.win:
+        return out + block("Speed", words("no requests in this window"), w, sep=" ")
+    first = int(v.now // bs) - n + 1
+    tok, dur, outb = [0.0] * n, [0.0] * n, [0.0] * n
+    lats = [[] for _ in range(n)]
+    for r in v.win:
+        i = int(r[R_END] // bs) - first
+        if not 0 <= i < n:
+            continue
+        outb[i] += r[R_OUT]
+        d = req_duration(r)
+        if d:
+            tok[i] += r[R_OUT]
+            dur[i] += d
+        lat = req_latency(r)
+        if lat is not None:
+            lats[i].append(lat)
+
+    if v.timed:
+        last8 = sorted(v.timed, key=lambda x: x[0][R_END])[-8:]
+        now_tps = sum(r[R_OUT] for r, _ in last8) / sum(d for _, d in last8)
+        rates = sorted(r[R_OUT] / d for r, d in v.timed)
+        pct = lambda q: rates[min(len(rates) - 1, int(q * len(rates)))]
+        out += block("Speed", [
+            f"{BOLD}{C_WHITE}{now_tps:.0f} tok/s{RST} {C_GREY}now{RST}",
+            kv("avg", f"{speed_of(v.win):.0f}"),
+            kv("median", f"{pct(.5):.0f}"),
+            kv("p90", f"{pct(.9):.0f}"),
+        ], w, SPEED_RGB)
+        out += chart_block([tok[i] / dur[i] if dur[i] else None for i in range(n)], bw, 3, w,
+                           lambda x: f"{x:.0f}", SPEED_RGB)
+        out.append("")
+    all_lats = sorted(x for b in lats for x in b)
+    if all_lats:
+        recent = [x for b in lats[-max(1, 600 // bs):] for x in b]
+        out += block("Latency", [
+            f"{BOLD}{C_WHITE}{statistics.median(all_lats):.1f}s{RST} {C_GREY}median{RST}",
+            kv("p90", f"{all_lats[int(.9 * (len(all_lats) - 1))]:.1f}s"),
+            kv("last 10 min", f"{statistics.median(recent):.1f}s") if recent else "",
+        ], w, LAT_RGB)
+        out += chart_block([statistics.median(b) if b else None for b in lats], bw, 2, w,
+                           lambda x: f"{x:g}s", LAT_RGB)
+        out.append("")
+    tout = sum(outb)
+    est = sum(r[R_OUT] for r in v.win if not r[R_FINAL])
+    out += block("Output", [
+        f"{BOLD}{C_WHITE}{fmt_num(tout)}{RST} {C_GREY}tokens{RST}",
+        kv("", f"{fmt_num(tout / (v.win_s / 60))}/min"),
+        kv("requests", fmt_num(len(v.win))),
+    ], w, OUT_RGB)
+    if est:
+        out += block("", words(f"incl. ≈{fmt_num(est)} estimated for background subagents", FAINT), w, sep=" ")
+    out += chart_block([x or None for x in outb], bw, 3, w, fmt_num, OUT_RGB)
+    out.append(" " * LABEL_W + bucket_axis(first, bs, n, bw, cw))
+    out.append("")
+    ttl = cache_ttl(v.win)
+    out += block("Cache", [
+        f"{BOLD}{C_WHITE}{cache_hit(v.win) or 0:.0f}%{RST} {C_GREY}hit{RST}",
+        kv("read", fmt_num(sum(r[R_CR] for r in v.win))),
+        kv("written", fmt_num(sum(r[R_CC] for r in v.win))),
+        kv("uncached", fmt_num(sum(r[R_IN] for r in v.win))),
+        kv("lifetime", ttl) if ttl else "",
+    ], w, WHITE)
+    return out
+
+
+def today_section(v, w):
+    out = section("Today", "since midnight", w)
+    out += block("Totals", [
+        kv("output", fmt_num(sum(r[R_OUT] for r in v.today))),
+        kv("requests", fmt_num(len(v.today))),
+        kv("speed", f"{speed_of(v.today) or 0:.0f} tok/s"),
+        kv("latency", f"{latency_of(v.today) or 0:.1f}s"),
+        kv("cache hit", f"{cache_hit(v.today) or 0:.0f}%"),
+    ], w, WHITE)
+    return out
+
+
+def breakdown_table(v, title, keyf, n, w):
+    agg = {}
+    for r in v.win:
+        agg.setdefault(keyf(r), []).append(r)
+    tot = sum(r[R_OUT] for r in v.win) or 1
+    name_w = max(8, w - 26)
+    out = [C_GREY + fit(title, name_w) + f"{'output':>8}{'share':>7}{'tok/s':>8}" + RST]
+    for k, rs in sorted(agg.items(), key=lambda kv_: -sum(r[R_OUT] for r in kv_[1]))[:n]:
+        o = sum(r[R_OUT] for r in rs)
+        sp = speed_of(rs)
+        out.append(C_WHITE + fit(k, name_w) + RST + f"{fmt_num(o):>8}" + C_GREY + f"{o / tot * 100:>6.0f}%"
+                   + RST + f"{f'{sp:.0f}' if sp else '–':>8}")
+    if len(out) == 1:
+        out.append(C_GREY + "no requests" + RST)
+    return [fit(l, w) for l in out]
+
+
+def sessions_table(v, n, w):
+    by = {}
+    for r in v.recs:
+        if not r[R_SUB]:  # the session's own thread: its replies and its cache
+            by.setdefault(r[R_SESSION], []).append(r)
+    last = lambda s: max((r[R_END] for r in by.get(s.get("sessionId"), [])), default=0)
+    name_w = max(8, w - 30)
+    out = [C_GREY + fit("Session", name_w) + f"{'state':<7}{'cache':<11}{'last reply':>12}" + RST]
+    for s in sorted(v.active, key=last, reverse=True)[:n]:
+        rs = by.get(s.get("sessionId"), [])
+        st = s.get("status") or "?"
+        dot = fg(OK) + "●" if st == "busy" else C_FAINT + "○"
+        la = last(s)
+        # The prompt cache lives TTL past its last use; after that the next
+        # message re-writes the whole context (slower, costs more).
+        writes = [r for r in rs if r[R_CC]]
+        ttl = (3600 if max(writes, key=lambda r: r[R_END])[R_C1H] else 300) if writes else None
+        if not la or ttl is None:
+            cache = C_FAINT + "–"
+        elif v.now - la < ttl:
+            cache = C_GREY + f"warm {fmt_dur(ttl - (v.now - la))}"
+        else:
+            cache = C_FAINT + "expired"
+        name = s.get("name") or os.path.basename(s.get("cwd") or "?")
+        out.append(dot + RST + " " + C_WHITE + fit(name, name_w - 3) + RST + " "
+                   + fit(C_GREY + st + RST, 7) + fit(cache + RST, 11)
+                   + C_GREY + f"{fmt_ago(v.now - la) if la else '–':>12}" + RST)
+    if len(out) == 1:
+        out.append(C_GREY + "no open sessions" + RST)
+    return [fit(l, w) for l in out]
+
+
+def breakdown_section(v, w):
+    busy = sum(1 for s in v.active if s.get("status") == "busy")
+    out = section("Breakdown", f"last {v.win_h}h · {len(v.active)} open sessions, {busy} busy", w)
+    models = lambda cw: breakdown_table(v, "Model", lambda r: r[R_MODEL].replace("claude-", ""), 4, cw)
+    projects = lambda cw: breakdown_table(v, "Project", lambda r: v.project.get(r[R_SESSION], r[R_CWD]), 4, cw)
+    sessions = lambda cw: sessions_table(v, 4, cw)
+    builders = [models, projects, sessions]
+    n = 3 if w >= 3 * 44 + 8 else 2 if w >= 2 * 44 + 4 else 1
+    for i in range(0, 3, n):
+        chunk = builders[i:i + n]
+        widths = split_w(w, len(chunk))
+        if len(chunk) == 3:  # sessions carry more columns: give them the extra room
+            a = int((w - 8) * 0.29)
+            widths = [a, a, w - 8 - 2 * a]
+        out += columns([b(cw) for b, cw in zip(chunk, widths)], w)
+        if i + n < 3:
+            out.append("")
+    return out
+
+
+# ── Claude service status ─────────────────────────────────────────────────────
+class ClaudeStatus:
+    """status.claude.com (Statuspage) summary, fetched on a background thread
+    so a slow network never freezes the redraw loop."""
+
+    def __init__(self):
+        self.data, self.fetched, self.error, self.tried = None, 0.0, None, 0.0
+        self.thread = None
+
+    def refresh(self, now, every=60):
+        if (self.thread and self.thread.is_alive()) or now - self.tried < every:
+            return
+        self.tried = now
+        self.thread = threading.Thread(target=self._fetch, daemon=True)
+        self.thread.start()
+
+    def wait(self, timeout):
+        if self.thread:
+            self.thread.join(timeout)
+
+    def _fetch(self):
+        try:
+            req = urllib.request.Request(STATUS_URL, headers={"User-Agent": "cc-meter/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.data, self.fetched, self.error = json.load(resp), time.time(), None
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            self.error = f"status.claude.com unreachable: {e}"
+
+
+STATUS_RGB = {"none": OK, "operational": OK, "minor": WARN, "degraded_performance": WARN,
+              "major": BAD, "partial_outage": BAD, "critical": BAD, "major_outage": BAD,
+              "maintenance": ACCENT, "under_maintenance": ACCENT}
+
+
+def status_badge(cst):
+    """Header badge: overall state plus Claude Code's own component."""
+    d = cst.data
+    if not d:
+        return C_GREY + ("status unknown" if cst.error else "checking status…") + RST
+    ind = d.get("status") or {}
+    code = next((c for c in d.get("components") or [] if c.get("name") == "Claude Code"), None)
+    rgb = STATUS_RGB.get(ind.get("indicator"), GREY)
+    badge = f"{fg(rgb)}●{RST} {C_WHITE}{ind.get('description', '?')}{RST}"
+    if code and code.get("status") != "operational":
+        badge += f" {C_GREY}·{RST} {fg(STATUS_RGB.get(code['status'], WARN))}Claude Code " \
+                 f"{code['status'].replace('_', ' ')}{RST}"
+    return badge
+
+
+def status_rows(cst, w, now):
+    """Only what is wrong: degraded components, incidents, maintenance."""
+    d = cst.data or {}
+    out = []
+    bad = [c for c in d.get("components") or [] if c.get("status") != "operational"]
+    for c in bad:
+        name = re.sub(r"\s*\(.*\)", "", c.get("name") or "?")
+        out += wrap_segs([fg(STATUS_RGB.get(c["status"], WARN)) + "●" + RST] + words(name, WHITE)
+                         + words(c["status"].replace("_", " ")), w, " ")
+    for i in d.get("incidents") or []:
+        upd = parse_ts(i["updated_at"]) if i.get("updated_at") else now
+        out += wrap_segs([fg(STATUS_RGB.get(i.get("impact"), WARN)) + "▲" + RST] + words(i.get("name") or "", WHITE)
+                         + words(f"{i.get('status')} · updated {fmt_ago(now - upd)}"), w, " ")
+    for m in d.get("scheduled_maintenances") or []:
+        at = parse_ts(m["scheduled_for"]) if m.get("scheduled_for") else now
+        if m.get("status") == "in_progress" or at - now < 86400:
+            out += wrap_segs([fg(ACCENT) + "◆" + RST] + words(m.get("name") or "", WHITE)
+                             + words(f"maintenance {m.get('status')} · {fmt_clock(at, now)}"), w, " ")
+    return out
+
+
+HELP = [
+    ("Rate limits", "Your plan's usage limits, live from the Claude Code status line", [
+        ("5-hour", "Share of the rolling 5-hour limit used, and when it resets."),
+        ("Weekly", "Share of the 7-day limit used, and when it resets."),
+        ("bar", "Fills left to right; each cell is colored by its position "
+                "(green → yellow → amber → red), so the bar warms up as the limit fills."),
+        ("pace", "How many % of the limit you use per hour. '(last 30m)' / '(last 8h)' is "
+                 "measured from cc-meter's own samples over that span. '(avg since …)' is "
+                 "% used ÷ hours since the window opened, so nights and breaks pull it down "
+                 "and bursts pull it up; the weekly pace uses it until cc-meter has 8 h of "
+                 "samples. Example: 56% used 46 h after Tue 13:00 → 1.2%/h."),
+        ("sustainable", "The highest pace that still lands exactly at 100% at the reset. "
+                        "Pace is green well below it, amber near it, red above it."),
+        ("verdict", "The pace projected to the reset: On track (< 80% at reset), Tight "
+                    "(80-100%), or 'runs out', with when and how long before the reset. It is "
+                    "a forecast, not a fact: slow down and it moves out. Once the limit is spent it "
+                    "freezes on when it was hit."),
+        ("tokens / 1%", "Output tokens of this 5-hour window ÷ % used. Counts only this "
+                        "machine's transcripts; usage elsewhere makes 1% look cheaper."),
+        ("budget", "% per day you can spend and still last until the weekly reset."),
+        ("source", "Limits come from the status line of any running session (free). After "
+                   "60 s without one, cc-meter asks the usage API, which is rate limited "
+                   "and backs off on HTTP 429."),
+    ]),
+    ("Throughput", "All sessions incl. subagents, over the window (w changes it)", [
+        ("Speed", "Output tokens ÷ end-to-end request time: from your message or tool result "
+                  "to the last streamed block. Includes thinking and the wait for the first "
+                  "token, so it reads below raw decode speed. 'now' = the last 8 requests."),
+        ("Latency", "Time until the first block of a reply lands: an upper bound on "
+                    "time-to-first-token. Grows with context size and server load."),
+        ("Output", "Output tokens generated. Background subagents never log their final "
+                   "usage, so their share is estimated from the length of what they wrote, "
+                   "calibrated on your complete requests."),
+        ("cache hit", "Share of input tokens served from the prompt cache. High is good: "
+                      "cheaper and faster."),
+        ("Cache", "Prompt cache over the window: hit = share of input read from cache; "
+                  "read / written / uncached input tokens; lifetime = how long entries live "
+                  "after their last use (Claude Code writes 5-minute or 1-hour entries)."),
+        ("bars", "One bar per clock-aligned bucket (size in the section header); the scale "
+                 "on the left is the chart ceiling. A gap means no requests then."),
+    ]),
+    ("Today & breakdown", "", [
+        ("Today", "Totals since local midnight."),
+        ("Breakdown", "Output, share and speed by model and by project (working directory; "
+                      "subagent worktrees count toward the session that spawned them)."),
+        ("Sessions", "Open sessions: ● busy / ○ idle, time of the last reply, and the cache: "
+                     "'warm 42m' = its prompt cache lives 42 more minutes; 'expired' = the next "
+                     "message re-writes the whole context (slower, more expensive)."),
+        ("Status", "The header badge is status.claude.com; problems appear right under it."),
+    ]),
+    ("Refresh", "", [
+        ("screen", "Redrawn every second (clock, countdowns)."),
+        ("transcripts", "Re-read every 5 s, only the new bytes (-i to change)."),
+        ("limits", "Whenever any session's status line renders; usage API after 60 s "
+                   "without one (-u to change)."),
+        ("status", "status.claude.com every 60 s."),
+        ("storage", "~/.cache/cc-meter keeps 7-8 days: the transcript index (requests, ~10 MB) "
+                    "and limit samples (for pace and forecasts)."),
+    ]),
+    ("Keys", "", [
+        ("h  ?", "Toggle this help (Esc closes it)."),
+        ("↑ ↓  j k", "Scroll; also the mouse wheel, PgUp/PgDn, space/b, g/G for top/bottom."),
+        ("w", "Throughput window: 1, 2, 3, 6, 12, 24 h."),
+        ("r  u", "Re-read transcripts now / ask the usage API for limits now."),
+        ("q", "Quit."),
+    ]),
+]
+
+
+def help_screen(cols):
+    W = max(40, cols - 1)
+    w = W - 1
+    out = [f"{BOLD}{C_WHITE}cc-meter{RST}  {C_GREY}help — what every number means{RST}", ""]
+    for title, meta, items in HELP:
+        out += section(title, meta, w)
+        for term, text in items:
+            wrapped = textwrap.wrap(text, max(20, w - LABEL_W - 1)) or [""]
+            for j, chunk in enumerate(wrapped):
+                out.append(line(term if j == 0 else "", C_GREY + chunk + RST, w, WHITE))
+        out.append("")
+    out = [" " + l for l in out]
+    out.append(" " + fit(f"{C_GREY}h{RST} {C_FAINT}or{RST} {C_GREY}Esc{RST} {C_FAINT}back to the dashboard{RST}", w))
+    return [fit(l, W) for l in out]
+
+
+def render(tr, lim, cst, args, win_h, now, cols):
+    # One column short of the edge: a glyph in the last column leaves some
+    # terminals in a pending-wrap state that eats the next line.
+    W = max(40, cols - 1)
+    pad_l = 1
+    w = W - pad_l
+    v = View(tr, lim, win_h, now)
+    out = []
+    left = f"{BOLD}{C_WHITE}cc-meter{RST}  {C_GREY}Claude Code usage{RST}"
+    right = status_badge(cst) + f"  {C_FAINT}{dt.datetime.fromtimestamp(now):%H:%M:%S}{RST}"
+    gap = w - vis_len(left) - vis_len(right)
+    out.append(left + " " * gap + right if gap >= 2 else fit(right, w))
+    out += status_rows(cst, w, now)
+    out.append("")
+    if w >= 150:  # wide: limits and throughput side by side
+        lw, rw = split_w(w, 2, 6)
+        out += columns([limits_section(v, lw) + [""] + today_section(v, lw), throughput_section(v, rw)], w, 6)
+    else:
+        out += limits_section(v, w) + [""] + throughput_section(v, w) + [""] + today_section(v, w)
+    out.append("")
+    out += breakdown_section(v, w)
+    out = [" " * pad_l + l for l in out]
+    keys = (f"{C_GREY}q{RST} {C_FAINT}quit{RST}  {C_GREY}↑↓{RST} {C_FAINT}scroll{RST}  "
+            f"{C_GREY}w{RST} {C_FAINT}window {win_h}h{RST}  {C_GREY}r{RST} {C_FAINT}refresh{RST}  "
+            f"{C_GREY}u{RST} {C_FAINT}fetch limits{RST}  {C_GREY}h{RST} {C_FAINT}help{RST}")
+    out.append(" " + fit(keys, w))
+    return [fit(l, W) for l in out]
+
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description="Live dashboard for global Claude Code usage.")
+    ap.add_argument("-i", "--interval", type=float, default=5, help="transcript refresh, s (default 5)")
+    ap.add_argument("-u", "--usage-interval", type=float, default=60,
+                    help="poll the usage API when status-line data is older than this, s (default 60)")
+    ap.add_argument("-w", "--window", type=int, default=2, help="throughput window, hours (default 2)")
+    ap.add_argument("--once", action="store_true", help="print one frame and exit")
+    args = ap.parse_args()
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    win_h = args.window
+    tr, lim, cst = Transcripts(), Limits(), ClaudeStatus()
+    cst.refresh(time.time())
+    first_run = not tr.files
+
+    def progress(n, total):
+        sys.stderr.write(f"\r\033[Kindexing transcripts {n}/{total}…")
+        sys.stderr.flush()
+
+    tr.refresh(time.time(), progress if first_run else None)
+    if first_run:
+        sys.stderr.write("\r\033[K")
+    tr.save()
+    lim.read_statusline()
+    if time.time() - lim.fetched >= args.usage_interval:
+        lim.poll(time.time())
+
+    if args.once or not sys.stdout.isatty():
+        cols = shutil.get_terminal_size((160, 50)).columns
+        cst.wait(10)
+        print("\n".join(render(tr, lim, cst, args, win_h, time.time(), cols)))
+        return
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    signal.signal(signal.SIGWINCH, lambda *_: None)  # wakes select() to redraw
+    # Alt screen, hidden cursor, wheel reporting (hold Option/Shift to select text).
+    sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")
+    try:
+        tty.setcbreak(fd)
+        next_tr, next_usage, scroll, show_help = 0.0, time.time() + 30, 0, False
+        while True:
+            now = time.time()
+            if now >= next_tr:
+                tr.refresh(now)
+                next_tr = now + args.interval
+                if now - tr.saved > 300:
+                    tr.save()
+            lim.check_account(now)
+            if lim.need_poll:  # just switched accounts: the API knows the new numbers
+                lim.poll(now)
+            lim.read_statusline()
+            cst.refresh(now)
+            if now >= next_usage:
+                if now - lim.fetched >= args.usage_interval:
+                    lim.poll(now)
+                next_usage = now + 30
+            try:  # the live tty size; shutil would prefer a stale $COLUMNS
+                size = os.get_terminal_size(sys.stdout.fileno())
+            except OSError:
+                size = shutil.get_terminal_size()
+            frame = help_screen(size.columns) if show_help else \
+                render(tr, lim, cst, args, win_h, now, size.columns)
+            # Header and footer stay put; the panels between them scroll.
+            body, view_h = frame[1:-1], max(1, size.lines - 2)
+            scroll = max(0, min(scroll, len(body) - view_h))
+            footer = frame[-1]
+            if len(body) > view_h:  # position first, so a narrow window still shows it
+                footer = (C_GREY + f" {scroll + 1}-{scroll + view_h} of {len(body)} " + RST + footer)
+            footer = trunc(footer, size.columns - 1) if vis_len(footer) > size.columns - 1 else footer
+            frame = [frame[0]] + body[scroll:scroll + view_h] + [footer]
+            sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in frame) + "\033[J")
+            sys.stdout.flush()
+            # Wake at least each second so the clock and countdowns stay live.
+            wait = max(0.2, min(1.0, next_tr - time.time(), next_usage - time.time()))
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], wait)
+            except InterruptedError:
+                continue
+            if ready:
+                key = os.read(fd, 256).decode(errors="ignore")
+                page = max(1, size.lines - 4)
+                # Mouse wheel (SGR 1006): button 64 up, 65 down; may batch.
+                scroll -= 3 * len(re.findall(r"\033\[<64;", key))
+                scroll += 3 * len(re.findall(r"\033\[<65;", key))
+                for seq, delta in (("\033[A", -1), ("\033[B", 1), ("\033[5~", -page), ("\033[6~", page)):
+                    scroll += delta * key.count(seq)
+                key = re.sub(r"\033\[[0-9;<]*[A-Za-z~]", "", key)  # plain keys only from here
+                if "h" in key or "?" in key or (show_help and "\033" in key):
+                    show_help, scroll = not show_help, 0
+                    continue
+                scroll += key.count("j") - key.count("k") + page * (key.count(" ") - key.count("b"))
+                if "g" in key:
+                    scroll = 0
+                if "G" in key:
+                    scroll = 10 ** 6
+                if "q" in key or "\x03" in key:
+                    break
+                if "r" in key:
+                    next_tr = 0
+                if "u" in key:
+                    lim.retry_at, next_usage = 0, 0
+                    lim.fetched = 0  # force the API fallback once
+                if "w" in key:
+                    i = WINDOWS_H.index(win_h) if win_h in WINDOWS_H else -1
+                    win_h = WINDOWS_H[(i + 1) % len(WINDOWS_H)]
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        tr.save()
+
+
+if __name__ == "__main__":
+    main()
