@@ -13,7 +13,7 @@ It's a single Python 3 file and needs nothing outside the standard library.
 ## Install
 
 ```sh
-git clone https://github.com/palo-kunovsky/cc-meter.git
+git clone https://github.com/palo-kunovsky-flash/cc-meter.git
 cd cc-meter
 ./cc-meter            # live dashboard
 ./cc-meter --once     # print one frame and exit
